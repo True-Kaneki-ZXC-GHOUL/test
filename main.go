@@ -1,101 +1,113 @@
 package main
 
 import (
-	"bufio"
-	"fmt"
-	"io"
+	"encoding/json"
 	"net/http"
-	"os"
-	"strings"
+	"strconv"
 	"sync"
-	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 )
 
-func readFile(fileName string) ([]string, error){
-	file, err := os.Open(fileName)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var urls []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-        url := strings.TrimSpace(scanner.Text())
-        if url != "" {
-            urls = append(urls, url)
-        }
-    }
-
-	if err := scanner.Err(); err != nil {
-        return nil, err
-    }
-
-    return urls, nil
+type Task struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
 }
 
-func checkUrl(url string, timeout time.Duration, wg *sync.WaitGroup, results chan<- string){
-	defer wg.Done()
-
-	start := time.Now()
-
-    client := &http.Client{
-        Timeout: timeout,
-    }
-
-    resp, err := client.Get(url)
-    if err != nil {
-        elapsed := time.Since(start)
-        results <- fmt.Sprintf("[ERROR] `%s` (%v) - %v", url, elapsed, err)
-        return
-    }
-    defer resp.Body.Close()
-    elapsed := time.Since(start)
-
-	syze_bites, err := io.ReadAll(resp.Body)
-
-	if err != nil {
-		return
-	} 
-
-    result := fmt.Sprintf("[%d] `%s` (%v) (size: %v)", resp.StatusCode, url, elapsed, len(syze_bites))
-    results <- result
-
-}
+var (
+	tasks  = []Task{}
+	nextID = 1
+	mu     sync.RWMutex
+)
 
 func main() {
-	fileName := "urls.txt"
-	fmt.Println(readFile(fileName))
+	r := chi.NewRouter()
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
 
-	timeout := time.Duration(10 * time.Second)
+	r.Route("/api/v1/tasks", func(r chi.Router) {
+		r.Get("/", listTasks)
+		r.Post("/", createTask)
 
-    urls, err := readFile("urls.txt")
-    if err != nil {
-        fmt.Printf("Error reading URLs: %v\n", err)
-        os.Exit(1)
-    }
-    
-    if len(urls) == 0 {
-        fmt.Println("No URLs found in urls.txt")
-        return
-    }
-    
-    fmt.Printf("Checking %d URLs with timeout %v...\n\n", len(urls), timeout)
-    
-    var wg sync.WaitGroup
-    results := make(chan string, len(urls))
+		r.Group(func(r chi.Router) {
+			r.Use(adminOnly)
+			r.Delete("/{id}", deleteTask)
+		})
 
-    for _, url := range urls {
-        wg.Add(1)
-        go checkUrl(url, timeout, &wg, results)
-    }
+		r.Get("/{id}", getTask)
+	})
 
-    go func() {
-        wg.Wait()
-        close(results)
-    }()
-
-    for result := range results {
-        fmt.Println(result)
-    }
+	http.ListenAndServe(":8080", r)
 }
+
+func adminOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Admin-Key") != "secret123" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func listTasks(w http.ResponseWriter, r *http.Request) {
+	mu.RLock()
+	defer mu.RUnlock()
+	json.NewEncoder(w).Encode(tasks)
+}
+
+func createTask(w http.ResponseWriter, r *http.Request) {
+	var task Task
+	if err := json.NewDecoder(r.Body).Decode(&task); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	mu.Lock()
+	task.ID = nextID
+	nextID++
+	tasks = append(tasks, task)
+	mu.Unlock()
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(task)
+}
+
+func getTask(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "ошибка id", http.StatusBadRequest)
+		return
+	}
+	mu.RLock()
+	defer mu.RUnlock()
+	for _, task := range tasks {
+		if task.ID == id {
+			json.NewEncoder(w).Encode(task)
+			return
+		}
+	}
+	http.Error(w, "задача не найдена", http.StatusNotFound)
+}
+
+func deleteTask(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i, task := range tasks {
+		if task.ID == id {
+			tasks = append(tasks[:i], tasks[i+1:]...)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+	http.Error(w, "Task not found", http.StatusNotFound)
+}
+
+//список Invoke-RestMethod http://localhost:8080/api/v1/tasks
+//по айди  Invoke-RestMethod http://localhost:8080/api/v1/tasks/2
